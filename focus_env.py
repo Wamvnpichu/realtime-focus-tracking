@@ -1,40 +1,18 @@
 """
-focus_env.py — FocusManagementEnv v2
-=====================================
+focus_env.py - FocusManagementEnv v2
+====================================
 Window-based Reinforcement Learning Environment for Focus Monitoring.
 
-Kiến trúc mới (theo góp ý giảng viên):
-  1. State = sliding window W frames → statistical + trend features (phát hiện sớm)
-  2. Context features VÀO state: giờ, tuổi, nghề nghiệp, thời gian làm việc
-  3. Action space mở rộng: 6 actions (từ 3)
-  4. Reward function context-aware: age, time-of-day, work-duration, early-detection
-  5. session_id / timestamp KHÔNG vào state (chỉ dùng cho grouping & work_duration)
+Architecture Details:
+  1. State = sliding window (W frames) -> statistical + trend features (early detection).
+  2. Context features in state: age, hour, occupation, work duration.
+  3. Action space: 6 actions (0: Do Nothing, 1: Soft Nudge, etc).
+  4. Reward function: context-aware based on user profile and fatigue.
 
-State dimensions (24 total):
-  Window features (19):
-    [0:6]   mean của: head_pitch, head_yaw, head_roll, ear_score, mar_score, brow_dist
-    [6:12]  std  của: head_pitch, head_yaw, head_roll, ear_score, mar_score, brow_dist
-    [12]    person_detected_ratio   — tỷ lệ frame có người trong window
-    [13]    phone_presence_ratio    — tỷ lệ frame có điện thoại trong window
-    [14]    pitch_trend             — slope of head_pitch  (phát hiện sớm: cúi đầu)
-    [15]    yaw_trend               — slope of head_yaw    (phát hiện sớm: quay đầu)
-    [16]    ear_trend               — slope of ear_score   (phát hiện sớm: mắt nhắm)
-    [17]    distraction_ratio       — % frames distracted trong window
-    [18]    consec_max_norm         — max consecutive_frames / MAX_CONSECUTIVE
-  Context features (5):
-    [19]    hour_sin                — sin(2π·hour/24)
-    [20]    hour_cos                — cos(2π·hour/24)
-    [21]    age_norm                — (age - 18) / (65 - 18)
-    [22]    occupation_code         — 0.0..1.0
-    [23]    work_duration_norm      — timestamp / MAX_WORK_SEC
-
-Action space (6):
-    0: Do Nothing
-    1: Gentle Visual Reminder
-    2: Sound Alert
-    3: Suggest Short Break
-    4: Dim Screen
-    5: Play Focus Music
+State Dimensions (33 total):
+  - Window Stats (Means/Stds): Pitch, Yaw, Roll, EAR, MAR, Brow, Delta_Yaw, Delta_Pitch, Delta_EAR, Gaze
+  - Ratios & Trends: Person detected ratio, phone ratio, distraction ratio.
+  - Context Features: Hour (sin/cos), Age, Work Duration.
 """
 
 from __future__ import annotations
@@ -55,23 +33,24 @@ warnings.filterwarnings("ignore")
 
 WINDOW_SIZE: int = 10            # Number of frames per state (~3.3 s at 3 fps)
 FPS: float = 3.0                 # Assumed video frame rate
-MAX_CONSECUTIVE: float = 6000.0  # Max observed consecutive_frames (repaired data)
-MAX_WORK_SEC: float = 3600.0     # 60 min → normalise work duration (from timestamp)
+MAX_CONSECUTIVE: float = 300.0   # Max observed consecutive_frames (repaired data)
+MAX_WORK_SEC: float = 14400.0    # 4 hours → normalise work duration (from timestamp)
 
 # Continuous feature columns in the CSV (used for scaler + window stats)
 CONT_COLS: List[str] = [
     "head_pitch", "head_yaw", "head_roll",
     "ear_score",  "mar_score", "brow_dist",
+    "delta_yaw", "delta_pitch", "delta_ear", "gaze_ratio"
 ]
 
 # Columns used for trend (slope) computation — core early-detection signals
 TREND_COLS: List[str] = ["head_pitch", "head_yaw", "ear_score"]
 
 # State dimension:
-#   6 means + 6 stds + 1 person_ratio + 1 phone_ratio
-#   + 3 trends + 1 distraction_ratio + 1 consec_max_norm
+#   10 means + 10 stds + 1 person_ratio + 1 phone_ratio
+#   + 3 trends + 1 distraction_ratio + 1 consec_max_norm + 1 fatigue_score
 #   + 5 context
-STATE_DIM: int = len(CONT_COLS) * 2 + 2 + len(TREND_COLS) + 2 + 5  # = 24
+STATE_DIM: int = len(CONT_COLS) * 2 + 2 + len(TREND_COLS) + 3 + 5  # = 33
 
 # ──────────────────────────────────────────────────────────────────────────────
 # ACTION SPACE
@@ -140,31 +119,37 @@ def encode_context(
 
 def extract_window_features(window: pd.DataFrame) -> np.ndarray:
     """
-    Extract a 19-dim feature vector from a sliding window of frames.
-
-    Features:
-        Means (6):            temporal average of each continuous feature
-        Stds  (6):            temporal variability → instability signal
-        person_ratio (1):     proportion of frames with person detected
-        phone_ratio  (1):     proportion of frames with phone present
-        pitch_trend  (1):     linear slope of head_pitch  → looking-down trend
-        yaw_trend    (1):     linear slope of head_yaw   → drifting-away trend
-        ear_trend    (1):     linear slope of ear_score  → eyes-closing trend
-        distraction_ratio (1): fraction of distracted frames in window
-        consec_max_norm   (1): max consecutive_frames / MAX_CONSECUTIVE
-
-    Trend slopes are the KEY early-detection features: a negative ear_trend
-    or positive pitch_trend signals an impending distraction BEFORE the label
-    flips to 1, allowing the agent to act proactively.
+    Extract a feature vector from a sliding window of frames.
+    Implements Focus-and-Suppress logic (Idea A): if head is very still,
+    we amplify the attention (weight) given to eye features (EAR, Gaze)
+    while suppressing head features, because when static, blinking is the primary distraction signal.
     """
     n = len(window)
     feats: List[float] = []
+    
+    # FOCUS-AND-SUPPRESS ATTENTION
+    std_yaw = window["delta_yaw"].std(ddof=0)
+    std_pitch = window["delta_pitch"].std(ddof=0)
+    head_motion = (std_yaw + std_pitch) / 2.0
+    
+    eye_weight = 1.3 if head_motion < 0.1 else 1.0
+    head_weight = 0.7 if head_motion < 0.1 else 1.0
 
     # 1. Means
-    feats.extend(window[CONT_COLS].mean().values.tolist())
+    means = window[CONT_COLS].mean().values.copy()
+    means[0:3] *= head_weight
+    means[3:6] *= eye_weight
+    means[6:8] *= head_weight
+    means[8:10] *= eye_weight
+    feats.extend(means.tolist())
 
-    # 2. Within-window standard deviations (ddof=0 → population std)
-    feats.extend(window[CONT_COLS].std(ddof=0).fillna(0.0).values.tolist())
+    # 2. Within-window standard deviations
+    stds = window[CONT_COLS].std(ddof=0).fillna(0.0).values.copy()
+    stds[0:3] *= head_weight
+    stds[3:6] *= eye_weight
+    stds[6:8] *= head_weight
+    stds[8:10] *= eye_weight
+    feats.extend(stds.tolist())
 
     # 3. Binary presence ratios
     feats.append(float(window["person_detected"].mean()))
@@ -175,6 +160,10 @@ def extract_window_features(window: pd.DataFrame) -> np.ndarray:
     for col in TREND_COLS:
         y = window[col].values.astype(np.float64)
         slope = float(np.polyfit(x, y, 1)[0]) if n > 1 else 0.0
+        if 'pitch' in col or 'yaw' in col:
+            slope *= head_weight
+        elif 'ear' in col:
+            slope *= eye_weight
         feats.append(slope)
 
     # 5. Distraction ratio in window
@@ -182,6 +171,9 @@ def extract_window_features(window: pd.DataFrame) -> np.ndarray:
 
     # 6. Max consecutive frames (normalised)
     feats.append(float(window["consecutive_frames"].max() / MAX_CONSECUTIVE))
+    
+    # 7. Fatigue score (Idea D)
+    feats.append(float(window["fatigue_score"].iloc[-1]))
 
     return np.array(feats, dtype=np.float32)
 
@@ -202,169 +194,51 @@ def compute_reward(
     hour: float,
     work_duration_min: float,
     spam_count: int,
+    fatigue_score: float,
+    person_ratio: float,
 ) -> float:
-    """
-    Context-aware reward function — v3 (balanced for real data distribution).
-
-    Design rationale:
-        The dataset is ~48% fully-focused (ratio=0.0) and ~51% fully-distracted
-        (ratio=1.0) with only ~1% in transition zones. The old reward function
-        gave +1.5 per focused step but -5.0 per severe step, making positive
-        total reward mathematically impossible.
-
-        This version balances the magnitudes so a correct oracle achieves
-        ~+1.0/step on average across the real data distribution. Penalties for
-        wrong actions are small enough that early training exploration doesn't
-        cause catastrophic negative reward, while still providing clear gradient
-        signal for the agent to learn the correct policy.
-
-    Reward structure:
-        R_total = R_core * context_scale - R_spam
-
-    Four distraction zones:
-        FOCUSED      distraction_ratio < 0.20  -> reward silence
-        EARLY WARNING 0.20-0.45 (or trend)     -> reward proactive soft action
-        MODERATE     0.45-0.75                 -> reward intervention
-        SEVERE       >= 0.75                   -> reward strong action
-
-    Context modifiers (SMALL — avoid amplifying imbalance):
-        context_scale  — time-of-day: 0.90 to 1.10
-        age modifier   — small bonus/penalty: max +/-0.15
-        break_bonus    — +0.10 for action=3 after long work
-        spam_penalty   — -0.20 * excess
-
-    Args:
-        action:            Chosen action index (0-5)
-        distraction_ratio: Fraction of window frames labelled distracted (0-1)
-        consec_max_norm:   Max consecutive_frames / MAX_CONSECUTIVE
-        pitch_trend:       Head-pitch slope (positive = looking down)
-        yaw_trend:         Head-yaw slope (head drifting sideways)
-        ear_trend:         Eye-aspect-ratio slope (negative = eyes closing)
-        age:               User age in years
-        hour:              Hour of day (0-23)
-        work_duration_min: Minutes elapsed in session
-        spam_count:        Consecutive steps where agent chose action > 0
-
-    Returns:
-        float: reward value clipped to [-3, +3]
-    """
-
-    # -- 1. Time-of-day scale (SMALL range: 0.90 - 1.10) ------------------
-    if 6 <= hour < 12:
-        context_scale = 1.10    # Morning: slightly higher stakes
-    elif 12 <= hour < 17:
-        context_scale = 1.00    # Afternoon: baseline
-    elif 17 <= hour < 22:
-        context_scale = 0.95    # Evening: slightly more tolerant
-    else:
-        context_scale = 0.90    # Night: most tolerant
-
-    # -- 2. Age-based modifier (SMALL: max +/-0.15) ------------------------
-    if age < 30:
-        hard_penalty  =  0.00
-        gentle_bonus  =  0.00
-    elif age < 45:
-        hard_penalty  = -0.05
-        gentle_bonus  =  0.05
-    elif age < 60:
-        hard_penalty  = -0.10
-        gentle_bonus  =  0.10
-    else:
-        hard_penalty  = -0.15
-        gentle_bonus  =  0.15
-
-    # -- 3. Work-duration break bonus (SMALL) ------------------------------
-    break_bonus = float(np.clip(work_duration_min / 120.0, 0.0, 1.0)) * 0.10
-
-    # -- 4. Early-distraction detection signal -----------------------------
-    # DISABLED: With current dataset (~0.6% transition zone), the trend-based
-    # thresholds (ear_trend < -0.02, pitch_trend > 1.0) fire falsely 26.9%
-    # of the time in focused windows, causing action 0 to be penalised
-    # instead of rewarded. Early warning now only uses distraction_ratio.
     early_signal: bool = False
+    consecutive_frames = consec_max_norm * MAX_CONSECUTIVE
+    
+    if consecutive_frames < 50:
+        if pitch_trend > 1.00 or ear_trend < -0.02:
+            early_signal = True
+            
+    person_missing = person_ratio < 0.5
+    age_factor = np.clip((age - 18) / (65 - 18), 0.0, 1.0)
+    gentle_bonus = 0.05 + 0.10 * age_factor
+    hard_penalty = -(0.05 + 0.10 * age_factor)
+    is_night = hour >= 22 or hour <= 6
+    context_scale = 1.10 if is_night else 0.90
+    break_bonus = 0.10 if work_duration_min > 45.0 else 0.0
+    severity = min(1.0, consecutive_frames / 150.0)
 
-    # -- 5. Severity factor for severe zone --------------------------------
-    # Use consec_max_norm to scale rewards in severe zone: higher consecutive
-    # distraction = more urgency for strong action.
-    severity = float(np.clip(consec_max_norm, 0.0, 1.0))
-
-    # -- 6. Core reward table (BALANCED magnitudes) ------------------------
-    #
-    # Design: correct action gives +1.0 base, wrong action gives -0.5 to -1.5.
-    # With ~48% focused (+1.0 each) and ~51% severe (+1.0 each), a perfect
-    # oracle achieves ~+1.0/step average. An agent doing random actions gets
-    # ~-0.3/step, providing clear learning signal without catastrophic negatives.
-
-    if distraction_ratio < 0.20:
-        # -- FOCUSED -------------------------------------------------------
-        # User is productive. Wrong actions should be mildly penalised, not
-        # catastrophically — the agent needs room to explore at training start.
-        core = {
-            0: +1.00,   # Correct: stay silent
-            1: -0.10,   # Gentle visual: barely noticeable disturbance
-            2: -0.30,   # Sound alert: most disruptive
-            3: -0.05,   # Suggest break: harmless
-            4: -0.10,   # Screen dim: minor
-            5: +0.05,   # Focus music: arguably helpful even when focused
-        }
-
-    elif early_signal or (0.20 <= distraction_ratio < 0.45):
-        # -- EARLY WARNING -------------------------------------------------
-        core = {
-            0: -0.50,              # Missing early intervention
-            1: +1.00,              # Gentle visual: good
-            2: -0.30,              # Sound alert: overreaction
-            3: +0.80 + break_bonus, # Break: good for long sessions
-            4: +0.80,              # Screen dim: non-disruptive
-            5: +1.00,              # Focus music: excellent early action
-        }
-
-    elif 0.45 <= distraction_ratio < 0.75:
-        # -- MODERATE DISTRACTION ------------------------------------------
-        core = {
-            0: -0.80,              # Too passive
-            1: +0.70,              # Still appropriate
-            2: +0.60,              # Reasonable escalation
-            3: +1.00 + break_bonus, # Break: very valuable
-            4: +0.50,              # Helpful
-            5: +0.70,              # Good
-        }
-
+    if person_missing:
+        core = {0: -2.00, 1: +0.20, 2: +2.00, 3: +0.50, 4: -0.20, 5: -0.20}
+    elif consecutive_frames < 50 and not early_signal:
+        if fatigue_score > 0.8:
+            core = {0: +1.00, 1: -0.50, 2: -1.00, 3: +2.00, 4: -0.50, 5: +0.50}
+        else:
+            core = {0: +1.00, 1: -0.50, 2: -1.00, 3: -0.50, 4: -0.50, 5: -0.50}
+    elif early_signal or (50 <= consecutive_frames < 100):
+        core = {0: -1.50, 1: +1.50, 2: -0.50, 3: +0.80, 4: +0.80, 5: -0.50}
     else:
-        # -- SEVERE DISTRACTION (>= 0.75) ----------------------------------
-        # Scale reward by severity: more consecutive = stronger preference
-        # for hard interventions. If severity is low, gentle is better.
-        base_correct  = 0.20 + 1.10 * severity   # 0.20 to 1.30
-        base_gentle   = 0.80 - 0.60 * severity   # 0.80 to 0.20
-        base_nothing  = -(0.80 + 0.70 * severity) # -0.80 to -1.50
-
-        core = {
-            0: base_nothing,                        # Critical failure
-            1: base_gentle,                         # Too gentle but not terrible
-            2: base_correct,                        # Sound alert: appropriate
-            3: base_correct * 0.90 + break_bonus,   # Break: also very appropriate
-            4: base_gentle,                         # Too gentle
-            5: base_gentle,                         # Too gentle
-        }
+        # SEVERE DISTRACTION
+        core = {0: -2.50, 1: +0.50, 2: +2.00, 3: +1.50, 4: +0.50, 5: -1.00}
 
     base_reward = core[action]
-
-    # -- 7. Apply age modifier (small) -------------------------------------
-    if action == 2:               # Sound Alert
+    
+    if action == 2:
         base_reward += hard_penalty
-    elif action in (1, 4, 5):    # Gentle actions
+    elif action in (1, 4, 5):
         base_reward += gentle_bonus
-    elif action == 3:             # Break suggestion
+    elif action == 3:
         base_reward += gentle_bonus * 0.5
 
-    # -- 8. Apply time-of-day scale ----------------------------------------
     base_reward *= context_scale
 
-    # -- 9. Anti-spam penalty (lighter & capped) ---------------------------
-    if spam_count >= 3 and action > 0:
-        # Cap penalty at -1.0 so it doesn't completely destroy the reward signal
-        # during random exploration phases.
-        penalty = min(1.0, 0.20 * (spam_count - 2))
+    if spam_count >= 2 and action > 0:
+        penalty = min(2.0, 0.40 * (spam_count - 1))
         base_reward -= penalty
 
     return float(np.clip(base_reward, -3.0, 3.0))
@@ -506,6 +380,8 @@ class FocusManagementEnv(gym.Env):
             "pitch_trend": _slope("head_pitch"),
             "yaw_trend":   _slope("head_yaw"),
             "ear_trend":   _slope("ear_score"),
+            "fatigue_score": float(window["fatigue_score"].iloc[-1]),
+            "person_ratio": float(window["person_detected"].mean()),
         }
 
     # ── Gym interface ─────────────────────────────────────────────────────
@@ -556,6 +432,8 @@ class FocusManagementEnv(gym.Env):
             hour              = ctx["hour"],
             work_duration_min = work_duration_min,
             spam_count        = self.spam_count,
+            fatigue_score     = stats["fatigue_score"],
+            person_ratio      = stats["person_ratio"],
         )
 
         # ── Advance ───────────────────────────────────────────────────────
@@ -614,17 +492,32 @@ class FocusAgentInference:
             
         self.window_buffer = deque(maxlen=WINDOW_SIZE)
         self.consecutive_frames = 0
+        self.consecutive_looking_down = 0
         self.start_time = time.time()
         
-    def process_frame(self, head_pitch, head_yaw, head_roll, ear_score, mar_score, brow_dist, person_detected, phone_count, user_age, user_hour, user_occupation):
+        self.last_yaw = 0.0
+        self.last_pitch = 0.0
+        self.last_ear = 0.0
+        
+    def process_frame(self, head_pitch, head_yaw, head_roll, ear_score, mar_score, brow_dist, person_detected, phone_count, user_age, user_hour, user_occupation, gaze_ratio):
         """
         Takes raw metrics from a single frame, updates internal state, and returns the agent's action and status.
         """
+        # Track looking down duration
+        if head_pitch > 20 and abs(head_yaw) < 20 and ear_score >= 0.22:
+            self.consecutive_looking_down += 1
+        else:
+            self.consecutive_looking_down = 0
+
         # 1. Distraction Logic
+        # Exception for note-taking: looking down (positive pitch), not looking away (low yaw), eyes open, no phone, and not stuck looking down for > 30s
+        is_note_taking = (head_pitch > 20) and (abs(head_yaw) < 20) and (phone_count == 0) and (ear_score >= 0.20) and (self.consecutive_looking_down < 300)
+        
         is_distracted = 1 if (
-            (ear_score < 0.22) or
-            (abs(head_yaw) > 30) or
-            (abs(head_pitch) > 25) or
+            (ear_score < 0.20) or
+            (abs(head_yaw) > 40) or
+            (abs(head_pitch) > 30 and not is_note_taking) or
+            (head_pitch < -25) or  # looking up
             (phone_count > 0) or
             (person_detected == 0)
         ) else 0
@@ -635,6 +528,20 @@ class FocusAgentInference:
             self.consecutive_frames = 0
             
         # 2. Pack Features
+        # Compute deltas
+        delta_yaw = head_yaw - self.last_yaw
+        delta_pitch = head_pitch - self.last_pitch
+        delta_ear = ear_score - self.last_ear
+        
+        self.last_yaw = head_yaw
+        self.last_pitch = head_pitch
+        self.last_ear = ear_score
+        
+        # Calculate Fatigue
+        session_elapsed_sec = time.time() - self.start_time
+        norm_time = min(1.0, session_elapsed_sec / 3600.0) # max 1 hour
+        fatigue_score = min(1.0, norm_time * (0.4 - min(ear_score, 0.4)) * 2.5)
+        
         metrics = {
             'head_pitch': head_pitch,
             'head_yaw': head_yaw,
@@ -642,10 +549,18 @@ class FocusAgentInference:
             'ear_score': ear_score,
             'mar_score': mar_score,
             'brow_dist': brow_dist,
+            'delta_yaw': delta_yaw,
+            'delta_pitch': delta_pitch,
+            'delta_ear': delta_ear,
+            'gaze_ratio': gaze_ratio,
             'person_detected': person_detected,
             'phone_count': phone_count,
             'consecutive_frames': self.consecutive_frames,
-            'is_distracted_label': is_distracted
+            'is_distracted_label': is_distracted,
+            'fatigue_score': fatigue_score,
+            'age': user_age,
+            'hour': user_hour,
+            'occupation': user_occupation
         }
         
         self.window_buffer.append(metrics)
@@ -669,6 +584,27 @@ class FocusAgentInference:
             
             action, _ = self.rl_model.predict(state, deterministic=True)
             action_name = ACTION_NAMES[int(action)]
+            
+            # OVERRIDE: Prevent noisy interventions during perfect focus
+            if self.consecutive_frames < 50:
+                # Only allow break suggestion if heavily fatigued
+                if fatigue_score > 0.8 and action_name == "Suggest Short Break":
+                    pass
+                else:
+                    action_name = "Do Nothing"
+            
+            # FALLBACK OVERRIDE: Force actions if distracted for too long
+            if self.consecutive_frames >= 900:
+                action_name = "Sound Alert"
+            elif self.consecutive_frames >= 90 and action_name == "Do Nothing":
+                action_name = "Gentle Visual Reminder"
+                
+            # DOWNGRADE OVERRIDE: Prevent hard nudges from triggering too quickly
+            if action_name in ["Sound Alert", "Suggest Short Break"] and self.consecutive_frames < 900:
+                if self.consecutive_frames >= 90:
+                    action_name = "Gentle Visual Reminder"
+                else:
+                    action_name = "Do Nothing"
             
             dist_ratio = df_window['is_distracted_label'].mean()
             

@@ -115,6 +115,26 @@ def calculate_brow_dist(face_landmarks, frame_shape):
     dist = ((brow.x - eye.x)**2 * w**2 + (brow.y - eye.y)**2 * h**2)**0.5
     return dist
 
+def calculate_gaze_ratio(face_landmarks):
+    # Right eye, iris center: 473, right corner: 33, left corner: 133
+    # Left eye, iris center: 468, right corner: 362, left corner: 263
+    def gaze(iris_center_idx, right_corner_idx, left_corner_idx):
+        iris = face_landmarks[iris_center_idx]
+        right = face_landmarks[right_corner_idx]
+        left = face_landmarks[left_corner_idx]
+        eye_width = ((right.x - left.x)**2 + (right.y - left.y)**2)**0.5
+        iris_dist = ((right.x - iris.x)**2 + (right.y - iris.y)**2)**0.5
+        if eye_width == 0:
+            return 0.5
+        return iris_dist / eye_width
+        
+    try:
+        left_gaze = gaze(468, 362, 263)
+        right_gaze = gaze(473, 33, 133)
+        return (left_gaze + right_gaze) / 2.0
+    except IndexError:
+        return 0.5
+
 def draw_ui_overlay(frame, metrics, dist_ratio, action_history, fps, session_time, current_action_name):
     h, w = frame.shape[:2]
     
@@ -184,11 +204,17 @@ def draw_ui_overlay(frame, metrics, dist_ratio, action_history, fps, session_tim
     cv2.line(frame, (20, y_offset), (300, y_offset), (100, 100, 100), 1)
     y_offset += 40
     
-    # Calculate window-based distraction ratio for stable UI
-    if dist_ratio < 0.20:
+    # Use consecutive_frames for stable UI thresholding
+    cf = metrics.get('consecutive_frames', 0)
+    person = metrics.get('person_detected', 1)
+    
+    if person == 0:
+        status_text = "USER MISSING"
+        status_color = COLOR_RED
+    elif cf < 50:
         status_text = "FOCUSED"
         status_color = COLOR_GREEN
-    elif dist_ratio < 0.45:
+    elif cf < 100:
         status_text = "EARLY WARNING"
         status_color = COLOR_ORANGE
     else:
@@ -302,10 +328,10 @@ def main():
         # 2. YOLO Inference
         results = yolo_model(frame, verbose=False)
         phone_count = sum(1 for box in results[0].boxes if int(box.cls) == 67 and float(box.conf) > 0.5)
+        yolo_person = 1 if sum(1 for box in results[0].boxes if int(box.cls) == 0 and float(box.conf) > 0.5) > 0 else 0
         
-        # 3. Feature Extraction
         person_detected = 0
-        pitch = yaw = roll = ear = mar = brow = 0.0
+        pitch = yaw = roll = ear = mar = brow = gaze_ratio = 0.0
         
         if detection_result.face_landmarks:
             face_landmarks = detection_result.face_landmarks[0]
@@ -314,12 +340,16 @@ def main():
             ear = calculate_ear(face_landmarks)
             mar = calculate_mar(face_landmarks)
             brow = calculate_brow_dist(face_landmarks, frame.shape)
+            gaze_ratio = calculate_gaze_ratio(face_landmarks)
+            
+        if person_detected == 0 and yolo_person > 0:
+            person_detected = 1
         
         # 4. Agent Inference 
         current_hour = args.hour if args.hour != -1 else datetime.datetime.now().hour
         metrics, dist_ratio, action_name = agent.process_frame(
             pitch, yaw, roll, ear, mar, brow, person_detected, phone_count,
-            args.age, current_hour, args.occupation
+            args.age, current_hour, args.occupation, gaze_ratio
         )
         
         if action_name:
