@@ -1,0 +1,19 @@
+# Core ML & Vision
+numpy
+pandas
+scikit-learn
+opencv-python
+mediapipe
+ultralytics
+stable-baselines3
+torch
+torchvision
+
+# LLM Integration
+google-genai
+
+# GUI and System
+pillow
+pygame-ce
+pywin32
+pyinstaller
