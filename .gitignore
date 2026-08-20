@@ -6,12 +6,3 @@ build/
 # Python caches
 __pycache__/
 *.pyc
-
-# Large models and assets
-models/
-assets/
-*.zip
-*.pt
-*.pkl
-*.task
-*.mp3
